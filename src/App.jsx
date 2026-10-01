@@ -11,8 +11,7 @@ import {
   doc, 
   setDoc, 
   getDoc, 
-  deleteDoc, 
-  collection 
+  deleteDoc 
 } from 'firebase/firestore';
 import { 
   Upload, 
@@ -36,7 +35,8 @@ import {
   HardDrive,
   FileArchive,
   Layers,
-  ArrowDownToLine
+  ArrowDownToLine,
+  Check
 } from 'lucide-react';
 
 const firebaseConfig = typeof __firebase_config !== 'undefined' 
@@ -80,7 +80,6 @@ const formatDisplayCode = (raw) => {
 
 export default function App() {
   const [user, setUser] = useState(null);
-  const [authLoading, setAuthLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('send'); // 'send' | 'receive' | 'history'
   const [isStealthMode, setIsStealthMode] = useState(false);
   
@@ -92,14 +91,13 @@ export default function App() {
   const [duration, setDuration] = useState('1h'); 
   const [pinCode, setPinCode] = useState('');
   
-  // Progress & Upload status
-  const [isCreating, setIsCreating] = useState(false);
+  // Upload Progress & Instant Room Creation State
+  const [isUploading, setIsUploading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState({ stage: '', percent: 0, currentFile: '' });
   const [activeCreatedDrop, setActiveCreatedDrop] = useState(null);
 
   // Receive Tab States
   const [receiveCode, setReceiveCode] = useState('');
-  const [receivePin, setReceivePin] = useState('');
   const [isFetching, setIsFetching] = useState(false);
   const [downloadStatus, setDownloadStatus] = useState({ stage: '', percent: 0 });
   const [receivedDrop, setReceivedDrop] = useState(null);
@@ -114,6 +112,7 @@ export default function App() {
   const [errorMessage, setErrorMessage] = useState('');
   const [toastMessage, setToastMessage] = useState('');
   const [myHistory, setMyHistory] = useState([]);
+  const [copiedLink, setCopiedLink] = useState(false);
 
   const fileInputRef = useRef(null);
 
@@ -122,13 +121,11 @@ export default function App() {
       try {
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
           await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
+        } else if (!auth.currentUser) {
           await signInAnonymously(auth);
         }
       } catch (err) {
-        console.error("Firebase auth initialization error:", err);
-      } finally {
-        setAuthLoading(false);
+        console.warn("Background Firebase authentication notice:", err);
       }
     };
     initAuth();
@@ -162,8 +159,6 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!user) return;
-
     const urlParams = new URLSearchParams(window.location.search);
     const codeFromUrl = urlParams.get('code');
 
@@ -175,7 +170,7 @@ export default function App() {
         fetchDropFromCloud(cleanCode);
       }
     }
-  }, [user]);
+  }, []);
 
   const showToast = (msg) => {
     setToastMessage(msg);
@@ -256,45 +251,88 @@ export default function App() {
       return;
     }
 
-    if (!user) {
-      setErrorMessage('Menghubungkan ke jaringan Cloud... Silakan coba beberapa detik lagi.');
-      return;
-    }
+    // 1. INSTANT ROOM & QR CODE GENERATION (Zero waiting)
+    const cleanCode = generate6DigitCode();
+    const formattedCode = formatDisplayCode(cleanCode);
+    const createdAt = Date.now();
+    const expiresAt = createdAt + getExpirationMs(duration);
+    const shareUrl = `${window.location.origin}${window.location.pathname}?code=${cleanCode}`;
+    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(shareUrl)}`;
 
-    setIsCreating(true);
-    setUploadStatus({ stage: 'Persiapan data...', percent: 5, currentFile: '' });
+    const fileMetaList = files.map((f) => {
+      const rawBase64 = f.dataUrl;
+      const totalFileChunks = Math.ceil(rawBase64.length / CHUNK_SIZE);
+      return {
+        name: f.name,
+        size: f.size,
+        type: f.type,
+        totalChunks: totalFileChunks
+      };
+    });
+
+    const dropPayload = {
+      code: cleanCode,
+      formattedCode,
+      files: fileMetaList,
+      codeSnippet: codeSnippet.trim(),
+      codeLanguage,
+      snippetTitle: snippetTitle.trim() || 'Skrip Kodingan CampusDrop',
+      hasPin: Boolean(pinCode.trim()),
+      pin: pinCode.trim(),
+      createdAt,
+      expiresAt,
+      durationLabel: getDurationLabel(duration)
+    };
+
+    const createdObj = {
+      ...dropPayload,
+      shareUrl,
+      qrCodeUrl,
+      status: 'uploading' // 'uploading' | 'ready'
+    };
+
+    // Show room code & QR code INSTANTLY in the UI
+    setActiveCreatedDrop(createdObj);
+
+    // Update local history immediately
+    const newHistoryItem = {
+      code: cleanCode,
+      formattedCode,
+      createdAt,
+      expiresAt,
+      filesCount: files.length,
+      hasSnippet: Boolean(codeSnippet.trim()),
+      durationLabel: getDurationLabel(duration)
+    };
+    const updatedHistory = [newHistoryItem, ...myHistory.filter(h => h.code !== cleanCode)];
+    setMyHistory(updatedHistory);
+    localStorage.setItem('campusdrop_my_history', JSON.stringify(updatedHistory));
+
+    showToast(`Ruang #${formattedCode} berhasil dibuat! Mengunggah ke Cloud...`);
+
+    // 2. ASYNCHRONOUS CLOUD SYNC & CHUNKING IN BACKGROUND
+    setIsUploading(true);
+    setUploadStatus({ stage: 'Inisialisasi koneksi Cloud...', percent: 5, currentFile: '' });
 
     try {
-      const cleanCode = generate6DigitCode();
-      const formattedCode = formatDisplayCode(cleanCode);
-      const createdAt = Date.now();
-      const expiresAt = createdAt + getExpirationMs(duration);
+      // Ensure background Auth if not already signed in
+      if (!auth.currentUser) {
+        await signInAnonymously(auth);
+      }
 
-      // Process file metadata & upload chunks
-      const fileMetaList = [];
       let totalChunksCount = 0;
       let processedChunksCount = 0;
 
-      // Calculate total chunks across all files
       files.forEach((f) => {
-        const rawBase64 = f.dataUrl;
-        const totalFileChunks = Math.ceil(rawBase64.length / CHUNK_SIZE);
-        totalChunksCount += totalFileChunks;
+        totalChunksCount += Math.ceil(f.dataUrl.length / CHUNK_SIZE);
       });
 
+      // Upload each file in client-side chunks
       for (let fIdx = 0; fIdx < files.length; fIdx++) {
         const fileObj = files[fIdx];
         const rawBase64 = fileObj.dataUrl;
         const totalFileChunks = Math.ceil(rawBase64.length / CHUNK_SIZE);
 
-        fileMetaList.push({
-          name: fileObj.name,
-          size: fileObj.size,
-          type: fileObj.type,
-          totalChunks: totalFileChunks
-        });
-
-        // Split & upload chunks to Rule 1 strictly matched path: /artifacts/{appId}/public/data/drop_chunks/{cleanCode}_{fIdx}_{cIdx}
         for (let cIdx = 0; cIdx < totalFileChunks; cIdx++) {
           const start = cIdx * CHUNK_SIZE;
           const end = Math.min(start + CHUNK_SIZE, rawBase64.length);
@@ -314,74 +352,31 @@ export default function App() {
           processedChunksCount++;
           const percent = totalChunksCount > 0 ? Math.round((processedChunksCount / totalChunksCount) * 90) : 90;
           setUploadStatus({
-            stage: `Mengunggah ${fileObj.name} (Chunk ${cIdx + 1}/${totalFileChunks})`,
+            stage: `Mengunggah ${fileObj.name} (${cIdx + 1}/${totalFileChunks})`,
             percent,
             currentFile: fileObj.name
           });
         }
       }
 
-      // Upload main drop metadata doc
+      // Upload main drop document
       setUploadStatus({ stage: 'Finalisasi ruang Cloud...', percent: 95, currentFile: '' });
-
-      const dropPayload = {
-        code: cleanCode,
-        formattedCode,
-        files: fileMetaList,
-        codeSnippet: codeSnippet.trim(),
-        codeLanguage,
-        snippetTitle: snippetTitle.trim() || 'Skrip Kodingan CampusDrop',
-        hasPin: Boolean(pinCode.trim()),
-        pin: pinCode.trim(),
-        createdAt,
-        expiresAt,
-        durationLabel: getDurationLabel(duration)
-      };
-
       const dropDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'drops', cleanCode);
       await setDoc(dropDocRef, dropPayload);
 
-      const shareUrl = `${window.location.origin}${window.location.pathname}?code=${cleanCode}`;
-
-      const createdObj = {
-        ...dropPayload,
-        shareUrl,
-        qrCodeUrl: `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(shareUrl)}`
-      };
-
-      setActiveCreatedDrop(createdObj);
-
-      const newHistoryItem = {
-        code: cleanCode,
-        formattedCode,
-        createdAt,
-        expiresAt,
-        filesCount: files.length,
-        hasSnippet: Boolean(codeSnippet.trim()),
-        durationLabel: getDurationLabel(duration)
-      };
-
-      const updatedHistory = [newHistoryItem, ...myHistory.filter(h => h.code !== cleanCode)];
-      setMyHistory(updatedHistory);
-      localStorage.setItem('campusdrop_my_history', JSON.stringify(updatedHistory));
-
-      showToast(`Ruang CampusDrop #${formattedCode} berhasil dibuat di Cloud!`);
+      setActiveCreatedDrop((prev) => prev ? { ...prev, status: 'ready' } : null);
+      showToast(`Ruang #${formattedCode} fully tersinkronisasi di Cloud!`);
     } catch (err) {
-      console.error("Error creating chunked drop:", err);
-      setErrorMessage(`Gagal menyimpan ke Cloud: ${err.message}`);
+      console.error("Error uploading drop to Cloud:", err);
+      setErrorMessage(`Proses Cloud Sync terhambat: ${err.message}. Layar tetap menampilkan kode/QR lokal.`);
     } finally {
-      setIsCreating(false);
+      setIsUploading(false);
       setUploadStatus({ stage: '', percent: 0, currentFile: '' });
     }
   };
 
   const fetchDropFromCloud = async (rawCode, enteredPin = '') => {
     setErrorMessage('');
-    
-    if (!user) {
-      setErrorMessage('Koneksi Cloud sedang disiapkan. Silakan coba kembali...');
-      return;
-    }
 
     const cleanCode = (rawCode || '').replace(/[^0-9]/g, '');
     if (cleanCode.length !== 6) {
@@ -393,11 +388,15 @@ export default function App() {
     setDownloadStatus({ stage: 'Mencari ruang di Cloud...', percent: 10 });
 
     try {
+      if (!auth.currentUser) {
+        await signInAnonymously(auth);
+      }
+
       const dropDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'drops', cleanCode);
       const dropSnap = await getDoc(dropDocRef);
 
       if (!dropSnap.exists()) {
-        setErrorMessage('Kode ruang tidak ditemukan di Cloud. Pastikan kodenya benar atau buat ruang baru.');
+        setErrorMessage('Kode ruang tidak ditemukan di Cloud. Pastikan kode benar atau ruang belum dibuat.');
         setIsFetching(false);
         return;
       }
@@ -406,7 +405,7 @@ export default function App() {
       const now = Date.now();
 
       if (dropData.expiresAt && now > dropData.expiresAt) {
-        setErrorMessage('Kode ruang ini sudah kadaluarsa dan otomatis dihapus.');
+        setErrorMessage('Kode ruang ini telah kadaluarsa.');
         try { await deleteDoc(dropDocRef); } catch (e) {}
         setIsFetching(false);
         return;
@@ -414,7 +413,7 @@ export default function App() {
 
       // Validate PIN
       if (dropData.hasPin && dropData.pin) {
-        const pinToValidate = enteredPin || receivePin;
+        const pinToValidate = enteredPin || modalPinInput;
 
         if (!pinToValidate) {
           setPendingDropData(dropData);
@@ -476,10 +475,12 @@ export default function App() {
   };
 
   const handleManualDelete = async (cleanCode) => {
-    if (!user || !cleanCode) return;
+    if (!cleanCode) return;
     try {
-      const dropDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'drops', cleanCode);
-      await deleteDoc(dropDocRef);
+      if (auth.currentUser) {
+        const dropDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'drops', cleanCode);
+        await deleteDoc(dropDocRef);
+      }
       setReceivedDrop(null);
       setActiveCreatedDrop(null);
       showToast('Ruang CampusDrop berhasil dihapus permanen.');
@@ -496,6 +497,10 @@ export default function App() {
 
   const handleCopyText = (text, label) => {
     navigator.clipboard.writeText(text);
+    if (label === 'Link Akses Direct') {
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 2000);
+    }
     showToast(`${label} berhasil disalin ke clipboard!`);
   };
 
@@ -519,32 +524,34 @@ export default function App() {
 
   if (isStealthMode) {
     return (
-      <div className="fixed inset-0 z-50 bg-white text-slate-900 font-serif p-8 md:p-16 overflow-y-auto select-text">
+      <div className="fixed inset-0 z-50 bg-white text-slate-900 font-serif p-6 md:p-16 overflow-y-auto select-text">
         <div className="max-w-4xl mx-auto space-y-6 text-sm md:text-base leading-relaxed">
           <div className="border-b-2 border-slate-900 pb-4 flex justify-between items-start">
             <div>
-              <p className="text-xs font-sans tracking-widest text-slate-500 uppercase font-semibold">Jurnal Teknologi Informasi & Komputer • Vol. 12, No. 2</p>
+              <p className="text-xs font-sans tracking-widest text-slate-500 uppercase font-semibold">
+                Jurnal Teknologi Informasi & Komputer • Vol. 14, No. 3
+              </p>
               <h1 className="text-2xl md:text-3xl font-bold font-serif text-slate-900 mt-2">
-                Evaluasi Kinerja Algoritma Chunking Terdistribusi pada Sistem Transfer Berkas Asinkron
+                Analisis Performa Fragmentasi Berkas Base64 pada Arsitektur Cloud Peer-Sync Kampus
               </h1>
             </div>
             <button 
               onClick={() => setIsStealthMode(false)}
-              className="font-sans text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded border border-slate-300"
+              className="font-sans text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded border border-slate-300 font-semibold transition shrink-0"
             >
               Kembali [ESC]
             </button>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-sans bg-slate-50 p-4 rounded border border-slate-200">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-sans bg-slate-50 p-4 rounded-xl border border-slate-200">
             <div>
-              <p className="font-bold text-slate-800">Laboratorium Rekayasa Perangkat Lunak</p>
-              <p className="text-slate-600">Departemen Ilmu Komputer & Teknik Informatika</p>
+              <p className="font-bold text-slate-800">Laboratorium Komputasi Terdistribusi</p>
+              <p className="text-slate-600">Fakultas Ilmu Komputer & Teknologi Informasi</p>
             </div>
             <div>
-              <p className="font-bold text-slate-800">Abstrak Penyamaran</p>
+              <p className="font-bold text-slate-800">Ringkasan Penelitian</p>
               <p className="text-slate-600 italic">
-                Makalah ini membahas segmentasi serial data berukuran hingga 50MB melalui protokol NoSQL Cloud tanpa hambatan batas memori buffer single-document.
+                Studi ini mengevaluasi pengiriman payload hingga 50MB dengan chunking asynchronous tanpa hambatan blocking auth state.
               </p>
             </div>
           </div>
@@ -556,8 +563,15 @@ export default function App() {
             </p>
           </section>
 
+          <section className="space-y-3 font-serif">
+            <h2 className="text-lg font-bold border-b border-slate-200 pb-1 font-sans">2. Metodologi Chunking</h2>
+            <p className="text-justify">
+              Segmentasi berkas dilakukan secara sekuensial dengan buffer 450KB per item untuk menjaga konsistensi transaksi dokumen NoSQL.
+            </p>
+          </section>
+
           <div className="text-center pt-8 text-xs font-sans text-slate-400 border-t border-slate-200">
-            Tekan <span className="font-mono bg-slate-100 border px-1 rounded text-slate-700">ESC</span> untuk menutup penyamaran.
+            Tekan <span className="font-mono bg-slate-100 border px-1.5 py-0.5 rounded text-slate-700">ESC</span> untuk mengakhiri mode akademik.
           </div>
         </div>
       </div>
@@ -569,17 +583,17 @@ export default function App() {
       
       {/* Toast Notification */}
       {toastMessage && (
-        <div className="fixed top-5 right-5 z-50 bg-slate-900 text-white px-4 py-3 rounded-xl shadow-xl flex items-center space-x-3 border border-slate-800 animate-in fade-in slide-in-from-top-4">
+        <div className="fixed top-5 right-5 z-50 bg-slate-900 text-white px-4 py-3 rounded-2xl shadow-2xl flex items-center space-x-3 border border-slate-800 animate-in fade-in slide-in-from-top-4">
           <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
           <span className="text-sm font-medium">{toastMessage}</span>
         </div>
       )}
 
       {/* Header Bar */}
-      <header className="bg-white border-b border-slate-200/80 sticky top-0 z-30 shadow-sm backdrop-blur-md bg-white/90">
+      <header className="bg-white/90 border-b border-slate-200/80 sticky top-0 z-30 shadow-sm backdrop-blur-md">
         <div className="max-w-5xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
           <div className="flex items-center space-x-3">
-            <div className="w-9 h-9 rounded-xl bg-slate-900 text-white flex items-center justify-center font-bold shadow-md shadow-slate-900/10">
+            <div className="w-10 h-10 rounded-2xl bg-slate-900 text-white flex items-center justify-center font-bold shadow-md shadow-slate-900/10">
               <Zap className="w-5 h-5 fill-current text-indigo-400" />
             </div>
             <div>
@@ -587,17 +601,17 @@ export default function App() {
                 <span className="font-bold text-lg tracking-tight text-slate-900">CampusDrop</span>
                 <span className="bg-indigo-50 text-indigo-700 text-[10px] font-semibold px-2 py-0.5 rounded-full border border-indigo-200/60 flex items-center space-x-1">
                   <HardDrive className="w-3 h-3 text-indigo-500" />
-                  <span>Support 50MB Chunking</span>
+                  <span>Instant 50MB Sync</span>
                 </span>
               </div>
-              <p className="text-xs text-slate-500 hidden sm:block">Transfer Berkas Besar & Skrip Kodingan Tanpa Login</p>
+              <p className="text-xs text-slate-500 hidden sm:block">Transfer Berkas Besar & Skrip Kodingan Instan Tanpa Delay</p>
             </div>
           </div>
 
           <div className="flex items-center space-x-3">
             <button
               onClick={() => setIsStealthMode(true)}
-              className="flex items-center space-x-1.5 bg-slate-100 hover:bg-slate-200/80 text-slate-700 text-xs font-semibold px-3 py-2 rounded-lg border border-slate-200 transition"
+              className="flex items-center space-x-1.5 bg-slate-100 hover:bg-slate-200/80 text-slate-700 text-xs font-semibold px-3 py-2 rounded-xl border border-slate-200 transition"
               title="Tekan ESC untuk menyamarkan layar ke makalah akademik"
             >
               <EyeOff className="w-3.5 h-3.5 text-slate-500" />
@@ -668,7 +682,7 @@ export default function App() {
                 <div className="text-center max-w-lg mx-auto space-y-1">
                   <h2 className="text-xl sm:text-2xl font-bold text-slate-900">Kirim Berkas (S/d 50MB) & Kode</h2>
                   <p className="text-slate-500 text-xs sm:text-sm">
-                    File besar otomatis dipecah menjadi chunks & disinkronkan ke Cloud.
+                    Kode & QR Code dibuat secara <span className="font-semibold text-indigo-600">INSTAN</span> tanpa hambatan login.
                   </p>
                 </div>
 
@@ -806,13 +820,43 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Upload Progress Bar */}
-                {isCreating && (
-                  <div className="bg-indigo-50 border border-indigo-200/80 p-4 rounded-2xl space-y-2 animate-in fade-in">
+                <button
+                  onClick={handleCreateDrop}
+                  className="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold py-3.5 px-6 rounded-2xl shadow-lg shadow-slate-900/10 hover:shadow-slate-900/20 transition flex items-center justify-center space-x-2 text-sm"
+                >
+                  <Zap className="w-4 h-4 text-indigo-400 fill-current animate-pulse" />
+                  <span>Buat Ruang Instan (Dapatkan Kode & QR Sekarang)</span>
+                </button>
+
+              </div>
+            ) : (
+              <div className="bg-white rounded-3xl border border-slate-200/90 shadow-sm p-6 sm:p-8 space-y-6 animate-in fade-in">
+                
+                <div className="flex items-center justify-between border-b border-slate-100 pb-4">
+                  <div className="flex items-center space-x-2">
+                    <span className={`w-3 h-3 rounded-full ${isUploading ? 'bg-amber-500 animate-ping' : 'bg-emerald-500 animate-pulse'}`}></span>
+                    <span className={`text-xs font-bold px-2.5 py-1 rounded-full ${
+                      isUploading 
+                        ? 'bg-amber-50 text-amber-700 border border-amber-200' 
+                        : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                    }`}>
+                      {isUploading ? 'Proses Sinkronisasi Cloud...' : 'Tersimpan & Siap di Cloud'}
+                    </span>
+                  </div>
+                  <button 
+                    onClick={resetSendForm}
+                    className="text-xs text-slate-500 hover:text-slate-800 underline font-medium"
+                  >
+                    + Buat Drop Baru
+                  </button>
+                </div>
+
+                {isUploading && (
+                  <div className="bg-indigo-50/80 border border-indigo-200/80 p-4 rounded-2xl space-y-2 animate-in fade-in">
                     <div className="flex justify-between text-xs font-semibold text-indigo-900">
                       <span className="flex items-center space-x-2">
                         <Layers className="w-4 h-4 text-indigo-600 animate-spin" />
-                        <span>{uploadStatus.stage}</span>
+                        <span>{uploadStatus.stage || 'Memproses berkas...'}</span>
                       </span>
                       <span>{uploadStatus.percent}%</span>
                     </div>
@@ -824,44 +868,6 @@ export default function App() {
                     </div>
                   </div>
                 )}
-
-                <button
-                  onClick={handleCreateDrop}
-                  disabled={isCreating}
-                  className="w-full bg-slate-900 hover:bg-slate-800 text-white font-bold py-3.5 px-6 rounded-2xl shadow-lg shadow-slate-900/10 hover:shadow-slate-900/20 transition flex items-center justify-center space-x-2 text-sm disabled:opacity-50"
-                >
-                  {isCreating ? (
-                    <>
-                      <RefreshCw className="w-4 h-4 animate-spin text-indigo-400" />
-                      <span>Proses Upload Chunking Cloud...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Zap className="w-4 h-4 text-indigo-400 fill-current" />
-                      <span>Buat Ruang CampusDrop (Dapatkan Kode & QR)</span>
-                    </>
-                  )}
-                </button>
-
-              </div>
-            ) : (
-              /* Created Drop Active Panel */
-              <div className="bg-white rounded-3xl border border-slate-200/90 shadow-sm p-6 sm:p-8 space-y-6 animate-in fade-in">
-                
-                <div className="flex items-center justify-between border-b border-slate-100 pb-4">
-                  <div className="flex items-center space-x-2">
-                    <span className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse"></span>
-                    <span className="text-xs font-bold text-emerald-700 bg-emerald-50 border border-emerald-200/80 px-2.5 py-1 rounded-full">
-                      Tersimpan di Cloud Firestore
-                    </span>
-                  </div>
-                  <button 
-                    onClick={resetSendForm}
-                    className="text-xs text-slate-500 hover:text-slate-800 underline font-medium"
-                  >
-                    + Buat Drop Baru
-                  </button>
-                </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-12 gap-8 items-center">
                   
@@ -904,8 +910,8 @@ export default function App() {
                         onClick={() => handleCopyText(activeCreatedDrop.shareUrl, 'Link Akses Direct')}
                         className="flex-1 bg-slate-900 hover:bg-slate-800 text-white font-bold py-2.5 px-4 rounded-xl text-xs flex items-center justify-center space-x-2 transition"
                       >
-                        <Share2 className="w-4 h-4" />
-                        <span>Salin Link QR</span>
+                        {copiedLink ? <Check className="w-4 h-4 text-emerald-400" /> : <Share2 className="w-4 h-4" />}
+                        <span>{copiedLink ? 'Tersalin!' : 'Salin Link Auto-Fill'}</span>
                       </button>
 
                       <button
@@ -913,12 +919,12 @@ export default function App() {
                         className="bg-rose-50 hover:bg-rose-100 text-rose-700 font-semibold px-3 py-2.5 rounded-xl text-xs flex items-center space-x-1 border border-rose-200/80 transition"
                       >
                         <Trash2 className="w-4 h-4" />
-                        <span>Hapus Sekarang</span>
+                        <span>Hapus</span>
                       </button>
                     </div>
                   </div>
 
-                  {/* QR Code */}
+                  {/* QR Code display */}
                   <div className="md:col-span-5 flex flex-col items-center justify-center bg-slate-50 p-5 rounded-3xl border border-slate-200">
                     <img 
                       src={activeCreatedDrop.qrCodeUrl} 
@@ -930,7 +936,7 @@ export default function App() {
                         <Smartphone className="w-3.5 h-3.5 text-indigo-600" />
                         <span>Scan Kamera HP</span>
                       </p>
-                      <p className="text-[11px] text-slate-500 mt-0.5">Otomatis membuka ruang & mengunduh berkas!</p>
+                      <p className="text-[11px] text-slate-500 mt-0.5">Otomatis membuka room & mengunduh berkas!</p>
                     </div>
                   </div>
 
