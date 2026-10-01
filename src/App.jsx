@@ -40,7 +40,7 @@ import {
 } from "lucide-react";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyDu36mkP_J1pDYqVtkUSeFQ7lFQt3IieMY",
+  apiKey: "AIzaSyBFFEfoYY4SYsMVsYMKD8FZra0KjsdJ1b0",
   authDomain: "campus-drop-5520e.firebaseapp.com",
   projectId: "campus-drop-5520e",
   storageBucket: "campus-drop-5520e.firebasestorage.app",
