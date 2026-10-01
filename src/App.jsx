@@ -19,33 +19,26 @@ import {
   Code2, 
   ShieldCheck, 
   Clock, 
-  QrCode, 
   Copy, 
-  Check, 
-  Eye, 
   EyeOff, 
   Download, 
   FileText, 
-  KeyRound, 
-  Sparkles, 
   Lock, 
-  Unlock, 
   Search, 
   RefreshCw, 
   AlertCircle, 
   Trash2,
   Share2,
-  ExternalLink,
   Smartphone,
   CheckCircle2,
   X,
-  BookOpen,
-  ArrowRight,
-  ShieldAlert,
-  Zap
+  Zap,
+  HardDrive,
+  FileArchive,
+  Layers,
+  ArrowDownToLine
 } from 'lucide-react';
 
-// Setup Firebase using standard environment parameters or resilient fallback
 const firebaseConfig = typeof __firebase_config !== 'undefined' 
   ? JSON.parse(__firebase_config) 
   : {
@@ -62,7 +55,10 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'campus-drop-v1';
 
-// Formats bytes into human readable format (KB / MB)
+// Max chunk size in characters for Base64 strings (~450KB per chunk to stay safely below Firestore 1MB limit)
+const CHUNK_SIZE = 450 * 1024;
+const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50MB Limit
+
 const formatBytes = (bytes) => {
   if (bytes === 0) return '0 Bytes';
   const k = 1024;
@@ -71,48 +67,50 @@ const formatBytes = (bytes) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
 };
 
-// Generates a random 6-digit numeric code
 const generate6DigitCode = () => {
   const num = Math.floor(100000 + Math.random() * 900000);
   return num.toString();
 };
 
-// Format raw 6-digit string as XXX-XXX
 const formatDisplayCode = (raw) => {
-  const clean = raw.replace(/[^0-9]/g, '');
+  const clean = (raw || '').replace(/[^0-9]/g, '');
   if (clean.length <= 3) return clean;
   return `${clean.slice(0, 3)}-${clean.slice(3, 6)}`;
 };
 
 export default function App() {
-  // Authentication & System State
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('send'); // 'send' | 'receive' | 'history'
   const [isStealthMode, setIsStealthMode] = useState(false);
   
-  // Kirim (Send) State
+  // Send Tab States
   const [files, setFiles] = useState([]);
   const [codeSnippet, setCodeSnippet] = useState('');
   const [codeLanguage, setCodeLanguage] = useState('python');
   const [snippetTitle, setSnippetTitle] = useState('');
-  const [duration, setDuration] = useState('1h'); // '15m' | '1h' | '6h' | '24h'
+  const [duration, setDuration] = useState('1h'); 
   const [pinCode, setPinCode] = useState('');
+  
+  // Progress & Upload status
   const [isCreating, setIsCreating] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState({ stage: '', percent: 0, currentFile: '' });
   const [activeCreatedDrop, setActiveCreatedDrop] = useState(null);
 
-  // Terima (Receive) State
+  // Receive Tab States
   const [receiveCode, setReceiveCode] = useState('');
   const [receivePin, setReceivePin] = useState('');
   const [isFetching, setIsFetching] = useState(false);
+  const [downloadStatus, setDownloadStatus] = useState({ stage: '', percent: 0 });
   const [receivedDrop, setReceivedDrop] = useState(null);
+  const [downloadedFilesMap, setDownloadedFilesMap] = useState({}); // { fileIdx: dataUrl }
   
-  // PIN Verification Modal
+  // PIN Modal
   const [pinModalOpen, setPinModalOpen] = useState(false);
   const [pendingDropData, setPendingDropData] = useState(null);
   const [modalPinInput, setModalPinInput] = useState('');
 
-  // UI Alerts & Local History
+  // Toast & History
   const [errorMessage, setErrorMessage] = useState('');
   const [toastMessage, setToastMessage] = useState('');
   const [myHistory, setMyHistory] = useState([]);
@@ -149,7 +147,7 @@ export default function App() {
         setMyHistory(JSON.parse(savedHistory));
       }
     } catch (e) {
-      console.error("Failed to load history from storage", e);
+      console.error("Failed to load local history", e);
     }
   }, []);
 
@@ -174,7 +172,6 @@ export default function App() {
       if (cleanCode.length === 6) {
         setActiveTab('receive');
         setReceiveCode(formatDisplayCode(cleanCode));
-        // Auto trigger fetch drop directly from URL code parameter
         fetchDropFromCloud(cleanCode);
       }
     }
@@ -182,9 +179,7 @@ export default function App() {
 
   const showToast = (msg) => {
     setToastMessage(msg);
-    setTimeout(() => {
-      setToastMessage('');
-    }, 3500);
+    setTimeout(() => setToastMessage(''), 3500);
   };
 
   const handleFileSelect = (e) => {
@@ -200,12 +195,10 @@ export default function App() {
 
   const processFiles = (fileList) => {
     setErrorMessage('');
-    const newFiles = [];
-
+    
     for (let file of fileList) {
-      // Limit file size to 1MB per file for instant Firestore payload
-      if (file.size > 1024 * 1024) {
-        setErrorMessage(`File "${file.name}" (${formatBytes(file.size)}) melebihi batas 1MB untuk sync Cloud instan. Silakan gunakan file lebih kecil atau kirim berupa kode/skrip.`);
+      if (file.size > MAX_FILE_SIZE_BYTES) {
+        setErrorMessage(`File "${file.name}" (${formatBytes(file.size)}) melebihi batas maksimal 50MB.`);
         continue;
       }
 
@@ -264,11 +257,12 @@ export default function App() {
     }
 
     if (!user) {
-      setErrorMessage('Menghubungkan ke jaringan Cloud... Silakan coba sebentar lagi.');
+      setErrorMessage('Menghubungkan ke jaringan Cloud... Silakan coba beberapa detik lagi.');
       return;
     }
 
     setIsCreating(true);
+    setUploadStatus({ stage: 'Persiapan data...', percent: 5, currentFile: '' });
 
     try {
       const cleanCode = generate6DigitCode();
@@ -276,10 +270,64 @@ export default function App() {
       const createdAt = Date.now();
       const expiresAt = createdAt + getExpirationMs(duration);
 
+      // Process file metadata & upload chunks
+      const fileMetaList = [];
+      let totalChunksCount = 0;
+      let processedChunksCount = 0;
+
+      // Calculate total chunks across all files
+      files.forEach((f) => {
+        const rawBase64 = f.dataUrl;
+        const totalFileChunks = Math.ceil(rawBase64.length / CHUNK_SIZE);
+        totalChunksCount += totalFileChunks;
+      });
+
+      for (let fIdx = 0; fIdx < files.length; fIdx++) {
+        const fileObj = files[fIdx];
+        const rawBase64 = fileObj.dataUrl;
+        const totalFileChunks = Math.ceil(rawBase64.length / CHUNK_SIZE);
+
+        fileMetaList.push({
+          name: fileObj.name,
+          size: fileObj.size,
+          type: fileObj.type,
+          totalChunks: totalFileChunks
+        });
+
+        // Split & upload chunks to Rule 1 strictly matched path: /artifacts/{appId}/public/data/drop_chunks/{cleanCode}_{fIdx}_{cIdx}
+        for (let cIdx = 0; cIdx < totalFileChunks; cIdx++) {
+          const start = cIdx * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, rawBase64.length);
+          const chunkStr = rawBase64.substring(start, end);
+
+          const chunkDocId = `${cleanCode}_${fIdx}_${cIdx}`;
+          const chunkDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'drop_chunks', chunkDocId);
+
+          await setDoc(chunkDocRef, {
+            roomCode: cleanCode,
+            fileIndex: fIdx,
+            chunkIndex: cIdx,
+            data: chunkStr,
+            createdAt
+          });
+
+          processedChunksCount++;
+          const percent = totalChunksCount > 0 ? Math.round((processedChunksCount / totalChunksCount) * 90) : 90;
+          setUploadStatus({
+            stage: `Mengunggah ${fileObj.name} (Chunk ${cIdx + 1}/${totalFileChunks})`,
+            percent,
+            currentFile: fileObj.name
+          });
+        }
+      }
+
+      // Upload main drop metadata doc
+      setUploadStatus({ stage: 'Finalisasi ruang Cloud...', percent: 95, currentFile: '' });
+
       const dropPayload = {
         code: cleanCode,
         formattedCode,
-        files: files.map(f => ({ name: f.name, size: f.size, type: f.type, dataUrl: f.dataUrl })),
+        files: fileMetaList,
         codeSnippet: codeSnippet.trim(),
         codeLanguage,
         snippetTitle: snippetTitle.trim() || 'Skrip Kodingan CampusDrop',
@@ -290,11 +338,9 @@ export default function App() {
         durationLabel: getDurationLabel(duration)
       };
 
-      // Rule 1: Strict Firestore Collection Path for public shared drop data
       const dropDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'drops', cleanCode);
       await setDoc(dropDocRef, dropPayload);
 
-      // Create shareable URL for QR Code & Direct Link
       const shareUrl = `${window.location.origin}${window.location.pathname}?code=${cleanCode}`;
 
       const createdObj = {
@@ -305,7 +351,6 @@ export default function App() {
 
       setActiveCreatedDrop(createdObj);
 
-      // Save to Local History
       const newHistoryItem = {
         code: cleanCode,
         formattedCode,
@@ -320,12 +365,13 @@ export default function App() {
       setMyHistory(updatedHistory);
       localStorage.setItem('campusdrop_my_history', JSON.stringify(updatedHistory));
 
-      showToast(`Ruang CampusDrop ${formattedCode} berhasil dibuat di Cloud!`);
+      showToast(`Ruang CampusDrop #${formattedCode} berhasil dibuat di Cloud!`);
     } catch (err) {
-      console.error("Error creating drop in Firestore:", err);
-      setErrorMessage(`Gagal menyimpan ke Cloud Firestore: ${err.message}`);
+      console.error("Error creating chunked drop:", err);
+      setErrorMessage(`Gagal menyimpan ke Cloud: ${err.message}`);
     } finally {
       setIsCreating(false);
+      setUploadStatus({ stage: '', percent: 0, currentFile: '' });
     }
   };
 
@@ -337,16 +383,16 @@ export default function App() {
       return;
     }
 
-    const cleanCode = rawCode.replace(/[^0-9]/g, '');
+    const cleanCode = (rawCode || '').replace(/[^0-9]/g, '');
     if (cleanCode.length !== 6) {
       setErrorMessage('Kode transfer harus berupa 6-digit angka valid (contoh: 474-113)!');
       return;
     }
 
     setIsFetching(true);
+    setDownloadStatus({ stage: 'Mencari ruang di Cloud...', percent: 10 });
 
     try {
-      // Rule 1 & Rule 2: Fetch drop directly by ID from Firestore
       const dropDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'drops', cleanCode);
       const dropSnap = await getDoc(dropDocRef);
 
@@ -359,16 +405,14 @@ export default function App() {
       const dropData = dropSnap.data();
       const now = Date.now();
 
-      // Check Expiration
       if (dropData.expiresAt && now > dropData.expiresAt) {
-        setErrorMessage('Kode ruang ini sudah kadaluarsa dan otomatis dihapus dari server Cloud.');
-        // Clean up expired doc
+        setErrorMessage('Kode ruang ini sudah kadaluarsa dan otomatis dihapus.');
         try { await deleteDoc(dropDocRef); } catch (e) {}
         setIsFetching(false);
         return;
       }
 
-      // Check PIN protection
+      // Validate PIN
       if (dropData.hasPin && dropData.pin) {
         const pinToValidate = enteredPin || receivePin;
 
@@ -387,17 +431,60 @@ export default function App() {
         }
       }
 
-      // Validated successfully!
       setReceivedDrop(dropData);
       setPinModalOpen(false);
       setPendingDropData(null);
       setModalPinInput('');
-      showToast('Berhasil terhubung & mengambil data dari Cloud!');
+
+      // Auto download files chunk by chunk
+      if (dropData.files && dropData.files.length > 0) {
+        const reconstructedMap = {};
+
+        for (let fIdx = 0; fIdx < dropData.files.length; fIdx++) {
+          const fileMeta = dropData.files[fIdx];
+          const chunksArr = [];
+
+          for (let cIdx = 0; cIdx < fileMeta.totalChunks; cIdx++) {
+            setDownloadStatus({
+              stage: `Mengunduh ${fileMeta.name} (Chunk ${cIdx + 1}/${fileMeta.totalChunks})`,
+              percent: Math.round(((cIdx + 1) / fileMeta.totalChunks) * 100)
+            });
+
+            const chunkDocId = `${cleanCode}_${fIdx}_${cIdx}`;
+            const chunkDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'drop_chunks', chunkDocId);
+            const chunkSnap = await getDoc(chunkDocRef);
+
+            if (chunkSnap.exists()) {
+              chunksArr.push(chunkSnap.data().data);
+            }
+          }
+
+          reconstructedMap[fIdx] = chunksArr.join('');
+        }
+
+        setDownloadedFilesMap(reconstructedMap);
+      }
+
+      showToast('Berhasil terhubung & mengunduh berkas dari Cloud!');
     } catch (err) {
-      console.error("Error fetching drop from Firestore:", err);
+      console.error("Error fetching chunked drop:", err);
       setErrorMessage(`Gagal mengambil berkas dari Cloud: ${err.message}`);
     } finally {
       setIsFetching(false);
+      setDownloadStatus({ stage: '', percent: 0 });
+    }
+  };
+
+  const handleManualDelete = async (cleanCode) => {
+    if (!user || !cleanCode) return;
+    try {
+      const dropDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'drops', cleanCode);
+      await deleteDoc(dropDocRef);
+      setReceivedDrop(null);
+      setActiveCreatedDrop(null);
+      showToast('Ruang CampusDrop berhasil dihapus permanen.');
+    } catch (e) {
+      console.error("Error deleting drop:", e);
     }
   };
 
@@ -412,10 +499,11 @@ export default function App() {
     showToast(`${label} berhasil disalin ke clipboard!`);
   };
 
-  const handleDownloadFile = (fileItem) => {
+  const handleDownloadFile = (fileName, dataUrl) => {
+    if (!dataUrl) return;
     const link = document.createElement('a');
-    link.href = fileItem.dataUrl;
-    link.download = fileItem.name;
+    link.href = dataUrl;
+    link.download = fileName;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -435,9 +523,9 @@ export default function App() {
         <div className="max-w-4xl mx-auto space-y-6 text-sm md:text-base leading-relaxed">
           <div className="border-b-2 border-slate-900 pb-4 flex justify-between items-start">
             <div>
-              <p className="text-xs font-sans tracking-widest text-slate-500 uppercase font-semibold">Jurnal Teknologi Informasi dan Ilmu Komputer (JTIIK) • Vol. 11, No. 4</p>
+              <p className="text-xs font-sans tracking-widest text-slate-500 uppercase font-semibold">Jurnal Teknologi Informasi & Komputer • Vol. 12, No. 2</p>
               <h1 className="text-2xl md:text-3xl font-bold font-serif text-slate-900 mt-2">
-                Analisis Kinerja Algoritma Pemrosesan Paralel Terdistribusi pada Sistem Manajemen Memori Berbasis Komputasi Awan
+                Evaluasi Kinerja Algoritma Chunking Terdistribusi pada Sistem Transfer Berkas Asinkron
               </h1>
             </div>
             <button 
@@ -450,13 +538,13 @@ export default function App() {
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-sans bg-slate-50 p-4 rounded border border-slate-200">
             <div>
-              <p className="font-bold text-slate-800">I Gede Abakar, M.T.</p>
-              <p className="text-slate-600">Laboratorium Komputasi Terdistribusi & Rekayasa Perangkat Lunak</p>
+              <p className="font-bold text-slate-800">Laboratorium Rekayasa Perangkat Lunak</p>
+              <p className="text-slate-600">Departemen Ilmu Komputer & Teknik Informatika</p>
             </div>
             <div>
-              <p className="font-bold text-slate-800">Abstrak Penelitian</p>
+              <p className="font-bold text-slate-800">Abstrak Penyamaran</p>
               <p className="text-slate-600 italic">
-                Penelitian ini mengevaluasi efisiensi latensi transmisi paket data antar node dalam lingkungan laboratorium jaringan terisolasi menggunakan arsitektur event-driven berbasis non-blocking I/O.
+                Makalah ini membahas segmentasi serial data berukuran hingga 50MB melalui protokol NoSQL Cloud tanpa hambatan batas memori buffer single-document.
               </p>
             </div>
           </div>
@@ -464,36 +552,12 @@ export default function App() {
           <section className="space-y-3 font-serif">
             <h2 className="text-lg font-bold border-b border-slate-200 pb-1 font-sans">1. Pendahuluan</h2>
             <p className="text-justify">
-              Perkembangan infrastruktur sistem terdistribusi menuntut efisiensi tinggi dalam sinkronisasi status data tanpa menimbulkan beban pada memori utama (volatile memory). Dalam lingkungan komputasi jaringan lokal (LAN) maupun awan (Cloud), tantangan utama terletak pada mitigasi kebocoran alokasi buffer saat proses serialisasi objek berukuran besar diselesaikan.
+              Eksperimen komputasi awan membutuhkan efisiensi transmisi tinggi tanpa mengandalkan perangkat penyimpanan eksternal fisik. Metode pembagian chunking Base64 terbukti mengurangi beban latensi hingga 40% pada jaringan LAN kampus.
             </p>
-            <p className="text-justify">
-              Oleh karena itu, formulasi persamaan transmisi buffer didefinisikan sebagai fungsi f(x) terhadap alokasi memori acak M(t):
-            </p>
-            <div className="bg-slate-50 p-4 text-center font-mono text-sm border border-slate-200 rounded my-3">
-              F(t) = Lim (Δt → 0) ∑ [ M_i(t) × e^(-λt) ] / (1 + Log_2(N))
-            </div>
-          </section>
-
-          <section className="space-y-3 font-serif">
-            <h2 className="text-lg font-bold border-b border-slate-200 pb-1 font-sans">2. Metodologi & Pseudo-Code</h2>
-            <p className="text-justify">
-              Pengujian dilakukan menggunakan alur validasi dua arah dengan pemeriksaan stempel waktu (timestamp assertion) dan pengecekan integritas PIN 4-digit secara asinkron.
-            </p>
-            <div className="bg-slate-900 text-slate-100 p-4 rounded font-mono text-xs overflow-x-auto leading-normal">
-              <p className="text-emerald-400">// Algoritma Validasi Token Terdistribusi</p>
-              <p>FUNCTION ValidateCloudNode(nodeId, pinHash, expiresAt):</p>
-              <p className="pl-4">IF CurrentTimestamp() &gt; expiresAt THEN</p>
-              <p className="pl-8 text-rose-300">RETURN ERROR_EXPIRED_TOKEN</p>
-              <p className="pl-4">END IF</p>
-              <p className="pl-4">IF VerifySecurityHash(pinHash) == TRUE THEN</p>
-              <p className="pl-8 text-emerald-300">RETURN SUCCESS_payload_unlocked</p>
-              <p className="pl-4">END IF</p>
-              <p>END FUNCTION</p>
-            </div>
           </section>
 
           <div className="text-center pt-8 text-xs font-sans text-slate-400 border-t border-slate-200">
-            Tekan tombol <span className="font-mono bg-slate-100 border px-1 rounded text-slate-700">ESC</span> kapan saja untuk menutup penyamaran.
+            Tekan <span className="font-mono bg-slate-100 border px-1 rounded text-slate-700">ESC</span> untuk menutup penyamaran.
           </div>
         </div>
       </div>
@@ -503,7 +567,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 font-sans antialiased selection:bg-indigo-500 selection:text-white pb-16">
       
-      {/* Toast Notification Floating Banner */}
+      {/* Toast Notification */}
       {toastMessage && (
         <div className="fixed top-5 right-5 z-50 bg-slate-900 text-white px-4 py-3 rounded-xl shadow-xl flex items-center space-x-3 border border-slate-800 animate-in fade-in slide-in-from-top-4">
           <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
@@ -514,8 +578,6 @@ export default function App() {
       {/* Header Bar */}
       <header className="bg-white border-b border-slate-200/80 sticky top-0 z-30 shadow-sm backdrop-blur-md bg-white/90">
         <div className="max-w-5xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
-          
-          {/* Logo & Brand */}
           <div className="flex items-center space-x-3">
             <div className="w-9 h-9 rounded-xl bg-slate-900 text-white flex items-center justify-center font-bold shadow-md shadow-slate-900/10">
               <Zap className="w-5 h-5 fill-current text-indigo-400" />
@@ -523,20 +585,20 @@ export default function App() {
             <div>
               <div className="flex items-center space-x-2">
                 <span className="font-bold text-lg tracking-tight text-slate-900">CampusDrop</span>
-                <span className="bg-indigo-50 text-indigo-700 text-[10px] font-semibold px-2 py-0.5 rounded-full border border-indigo-200/60">
-                  Cloud Sync Real-time
+                <span className="bg-indigo-50 text-indigo-700 text-[10px] font-semibold px-2 py-0.5 rounded-full border border-indigo-200/60 flex items-center space-x-1">
+                  <HardDrive className="w-3 h-3 text-indigo-500" />
+                  <span>Support 50MB Chunking</span>
                 </span>
               </div>
-              <p className="text-xs text-slate-500 hidden sm:block">Transfer Berkas & Skrip Kodingan Tanpa Login</p>
+              <p className="text-xs text-slate-500 hidden sm:block">Transfer Berkas Besar & Skrip Kodingan Tanpa Login</p>
             </div>
           </div>
 
-          {/* Top Actions */}
           <div className="flex items-center space-x-3">
             <button
               onClick={() => setIsStealthMode(true)}
               className="flex items-center space-x-1.5 bg-slate-100 hover:bg-slate-200/80 text-slate-700 text-xs font-semibold px-3 py-2 rounded-lg border border-slate-200 transition"
-              title="Tekan ESC untuk menyamarkan layar ke tampilan makalah ilmiah"
+              title="Tekan ESC untuk menyamarkan layar ke makalah akademik"
             >
               <EyeOff className="w-3.5 h-3.5 text-slate-500" />
               <span>Nyamar</span>
@@ -554,9 +616,7 @@ export default function App() {
           <button
             onClick={() => { setActiveTab('send'); setErrorMessage(''); }}
             className={`flex-1 flex items-center justify-center space-x-2 py-2.5 px-4 rounded-xl text-xs sm:text-sm font-semibold transition ${
-              activeTab === 'send' 
-                ? 'bg-white text-slate-900 shadow-sm' 
-                : 'text-slate-600 hover:text-slate-900'
+              activeTab === 'send' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
             }`}
           >
             <Upload className="w-4 h-4" />
@@ -566,9 +626,7 @@ export default function App() {
           <button
             onClick={() => { setActiveTab('receive'); setErrorMessage(''); }}
             className={`flex-1 flex items-center justify-center space-x-2 py-2.5 px-4 rounded-xl text-xs sm:text-sm font-semibold transition ${
-              activeTab === 'receive' 
-                ? 'bg-white text-slate-900 shadow-sm' 
-                : 'text-slate-600 hover:text-slate-900'
+              activeTab === 'receive' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
             }`}
           >
             <Download className="w-4 h-4" />
@@ -578,9 +636,7 @@ export default function App() {
           <button
             onClick={() => { setActiveTab('history'); setErrorMessage(''); }}
             className={`flex-1 flex items-center justify-center space-x-2 py-2.5 px-4 rounded-xl text-xs sm:text-sm font-semibold transition ${
-              activeTab === 'history' 
-                ? 'bg-white text-slate-900 shadow-sm' 
-                : 'text-slate-600 hover:text-slate-900'
+              activeTab === 'history' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
             }`}
           >
             <Clock className="w-4 h-4" />
@@ -588,7 +644,7 @@ export default function App() {
           </button>
         </div>
 
-        {/* Global Error Notice Alert */}
+        {/* Global Error Notice */}
         {errorMessage && (
           <div className="mb-6 bg-rose-50 border border-rose-200 text-rose-800 px-4 py-3.5 rounded-2xl flex items-start space-x-3 text-sm animate-in fade-in">
             <AlertCircle className="w-5 h-5 text-rose-500 shrink-0 mt-0.5" />
@@ -610,23 +666,22 @@ export default function App() {
               <div className="bg-white rounded-3xl border border-slate-200/90 shadow-sm p-6 sm:p-8 space-y-6">
                 
                 <div className="text-center max-w-lg mx-auto space-y-1">
-                  <h2 className="text-xl sm:text-2xl font-bold text-slate-900">Kirim Berkas & Skrip Kodingan</h2>
+                  <h2 className="text-xl sm:text-2xl font-bold text-slate-900">Kirim Berkas (S/d 50MB) & Kode</h2>
                   <p className="text-slate-500 text-xs sm:text-sm">
-                    Transfer langsung ke PC Lab Kampus atau HP tanpa login WhatsApp Web atau bawa flashdisk.
+                    File besar otomatis dipecah menjadi chunks & disinkronkan ke Cloud.
                   </p>
                 </div>
 
-                {/* Upload File Box & Code Snippet Box Grid */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
                   
-                  {/* File Dropzone */}
+                  {/* File Upload Area */}
                   <div className="space-y-3">
                     <div className="flex items-center justify-between">
                       <label className="text-xs font-bold text-slate-700 uppercase tracking-wider flex items-center space-x-1.5">
                         <FileText className="w-4 h-4 text-indigo-600" />
-                        <span>1. Unggah File / Berkas</span>
+                        <span>1. Unggah File (Maks. 50MB)</span>
                       </label>
-                      <span className="text-[11px] text-slate-400 font-medium">Maks. 1MB / file</span>
+                      <span className="text-[11px] text-indigo-600 font-semibold bg-indigo-50 px-2 py-0.5 rounded-md">ZIP, PDF, DOC, IMG</span>
                     </div>
 
                     <div 
@@ -648,16 +703,15 @@ export default function App() {
                       <p className="text-xs font-semibold text-slate-700">
                         Tarik file ke sini, atau <span className="text-indigo-600 underline">pilih file</span>
                       </p>
-                      <p className="text-[11px] text-slate-400 mt-1">PDF, Word, ZIP, Gambar, atau Skrip Kodingan</p>
+                      <p className="text-[11px] text-slate-400 mt-1">Mendukung file besar hingga 50MB</p>
                     </div>
 
-                    {/* Selected File List */}
                     {files.length > 0 && (
                       <div className="space-y-2 pt-1">
                         {files.map((f) => (
                           <div key={f.id} className="flex items-center justify-between bg-slate-50 border border-slate-200 px-3 py-2 rounded-xl text-xs">
                             <div className="flex items-center space-x-2 truncate">
-                              <FileText className="w-4 h-4 text-slate-500 shrink-0" />
+                              <FileArchive className="w-4 h-4 text-indigo-500 shrink-0" />
                               <span className="font-medium text-slate-800 truncate">{f.name}</span>
                               <span className="text-[10px] text-slate-400 font-mono">({formatBytes(f.size)})</span>
                             </div>
@@ -673,7 +727,7 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* Code Snippet Editor Box */}
+                  {/* Code Editor Area */}
                   <div className="space-y-3">
                     <div className="flex items-center justify-between">
                       <label className="text-xs font-bold text-slate-700 uppercase tracking-wider flex items-center space-x-1.5">
@@ -690,7 +744,6 @@ export default function App() {
                         <option value="cpp">C++ / C</option>
                         <option value="java">Java</option>
                         <option value="html">HTML / CSS</option>
-                        <option value="sql">SQL Query</option>
                         <option value="plaintext">Teks Biasa</option>
                       </select>
                     </div>
@@ -715,7 +768,7 @@ export default function App() {
 
                 </div>
 
-                {/* Expiration & PIN Settings */}
+                {/* Expiration & PIN */}
                 <div className="border-t border-slate-100 pt-6">
                   <h3 className="text-xs font-bold text-slate-700 uppercase tracking-wider mb-4 flex items-center space-x-1.5">
                     <ShieldCheck className="w-4 h-4 text-emerald-600" />
@@ -730,10 +783,10 @@ export default function App() {
                         onChange={(e) => setDuration(e.target.value)}
                         className="w-full text-xs bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
                       >
-                        <option value="15m">15 Menit (Cepat Selesai Praktikum)</option>
+                        <option value="15m">15 Menit (Praktikum Cepat)</option>
                         <option value="1h">1 Jam (Rekomendasi Kampus)</option>
                         <option value="6h">6 Jam (Tugas Seharian)</option>
-                        <option value="24h">24 Jam (Maksimal simpan)</option>
+                        <option value="24h">24 Jam (Maksimal)</option>
                       </select>
                     </div>
 
@@ -753,7 +806,25 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Submit Action Button */}
+                {/* Upload Progress Bar */}
+                {isCreating && (
+                  <div className="bg-indigo-50 border border-indigo-200/80 p-4 rounded-2xl space-y-2 animate-in fade-in">
+                    <div className="flex justify-between text-xs font-semibold text-indigo-900">
+                      <span className="flex items-center space-x-2">
+                        <Layers className="w-4 h-4 text-indigo-600 animate-spin" />
+                        <span>{uploadStatus.stage}</span>
+                      </span>
+                      <span>{uploadStatus.percent}%</span>
+                    </div>
+                    <div className="w-full bg-indigo-200/60 rounded-full h-2 overflow-hidden">
+                      <div 
+                        className="bg-indigo-600 h-2 rounded-full transition-all duration-300" 
+                        style={{ width: `${uploadStatus.percent}%` }}
+                      ></div>
+                    </div>
+                  </div>
+                )}
+
                 <button
                   onClick={handleCreateDrop}
                   disabled={isCreating}
@@ -762,7 +833,7 @@ export default function App() {
                   {isCreating ? (
                     <>
                       <RefreshCw className="w-4 h-4 animate-spin text-indigo-400" />
-                      <span>Menyimpan ke Cloud Firestore...</span>
+                      <span>Proses Upload Chunking Cloud...</span>
                     </>
                   ) : (
                     <>
@@ -774,15 +845,14 @@ export default function App() {
 
               </div>
             ) : (
-              
-              /* Created Drop Success View */
+              /* Created Drop Active Panel */
               <div className="bg-white rounded-3xl border border-slate-200/90 shadow-sm p-6 sm:p-8 space-y-6 animate-in fade-in">
                 
                 <div className="flex items-center justify-between border-b border-slate-100 pb-4">
                   <div className="flex items-center space-x-2">
                     <span className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse"></span>
                     <span className="text-xs font-bold text-emerald-700 bg-emerald-50 border border-emerald-200/80 px-2.5 py-1 rounded-full">
-                      Transfer Aktif di Cloud
+                      Tersimpan di Cloud Firestore
                     </span>
                   </div>
                   <button 
@@ -795,7 +865,6 @@ export default function App() {
 
                 <div className="grid grid-cols-1 md:grid-cols-12 gap-8 items-center">
                   
-                  {/* Left Column: 6-Digit Code */}
                   <div className="md:col-span-7 space-y-4">
                     <div>
                       <p className="text-xs font-bold text-slate-400 uppercase tracking-widest">Kode Transfer 6-Digit</p>
@@ -823,7 +892,7 @@ export default function App() {
                         <span className="font-semibold text-slate-800">{activeCreatedDrop.hasPin ? 'Aktif (4-Digit)' : 'Tanpa PIN'}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-slate-500">Konten:</span>
+                        <span className="text-slate-500">Lampiran:</span>
                         <span className="font-semibold text-slate-800">
                           {activeCreatedDrop.files.length} File • {activeCreatedDrop.codeSnippet ? '1 Skrip Kode' : 'Tanpa Kode'}
                         </span>
@@ -832,28 +901,36 @@ export default function App() {
 
                     <div className="pt-2 flex flex-wrap gap-2">
                       <button
-                        onClick={() => handleCopyText(activeCreatedDrop.shareUrl, 'Link Akses Drop')}
+                        onClick={() => handleCopyText(activeCreatedDrop.shareUrl, 'Link Akses Direct')}
                         className="flex-1 bg-slate-900 hover:bg-slate-800 text-white font-bold py-2.5 px-4 rounded-xl text-xs flex items-center justify-center space-x-2 transition"
                       >
                         <Share2 className="w-4 h-4" />
-                        <span>Salin Link Direct</span>
+                        <span>Salin Link QR</span>
+                      </button>
+
+                      <button
+                        onClick={() => handleManualDelete(activeCreatedDrop.code)}
+                        className="bg-rose-50 hover:bg-rose-100 text-rose-700 font-semibold px-3 py-2.5 rounded-xl text-xs flex items-center space-x-1 border border-rose-200/80 transition"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                        <span>Hapus Sekarang</span>
                       </button>
                     </div>
                   </div>
 
-                  {/* Right Column: QR Code Scan */}
+                  {/* QR Code */}
                   <div className="md:col-span-5 flex flex-col items-center justify-center bg-slate-50 p-5 rounded-3xl border border-slate-200">
                     <img 
                       src={activeCreatedDrop.qrCodeUrl} 
-                      alt="QR Code Drop" 
+                      alt="QR Code" 
                       className="w-44 h-44 rounded-2xl border-4 border-white shadow-md bg-white p-2"
                     />
                     <div className="mt-3 text-center">
                       <p className="text-xs font-bold text-slate-800 flex items-center justify-center space-x-1">
                         <Smartphone className="w-3.5 h-3.5 text-indigo-600" />
-                        <span>Scan via Kamera HP</span>
+                        <span>Scan Kamera HP</span>
                       </p>
-                      <p className="text-[11px] text-slate-500 mt-0.5">Otomatis membuka & mengambil berkas tanpa perlu ketik kode!</p>
+                      <p className="text-[11px] text-slate-500 mt-0.5">Otomatis membuka ruang & mengunduh berkas!</p>
                     </div>
                   </div>
 
@@ -874,27 +951,42 @@ export default function App() {
               <div className="text-center max-w-md mx-auto space-y-1">
                 <h2 className="text-xl sm:text-2xl font-bold text-slate-900">Terima Berkas dari Cloud</h2>
                 <p className="text-slate-500 text-xs sm:text-sm">
-                  Masukkan 6-digit kode room yang didapatkan dari laptop pengirim atau kamera HP.
+                  Masukkan 6-digit kode room untuk mendownload file & skrip kodingan.
                 </p>
               </div>
 
-              {/* Code Search Input Box */}
               <div className="max-w-md mx-auto space-y-4">
                 <div>
                   <label className="text-xs font-bold text-slate-700 uppercase tracking-wider block mb-2 text-center">
                     Kode Transfer 6-Digit
                   </label>
-                  <div className="relative">
-                    <input 
-                      type="text"
-                      maxLength={7}
-                      placeholder="474-113"
-                      value={receiveCode}
-                      onChange={(e) => setReceiveCode(formatDisplayCode(e.target.value))}
-                      className="w-full text-center text-3xl font-mono font-extrabold tracking-widest bg-slate-50 border border-slate-300 rounded-2xl py-4 px-4 text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 uppercase"
-                    />
-                  </div>
+                  <input 
+                    type="text"
+                    maxLength={7}
+                    placeholder="474-113"
+                    value={receiveCode}
+                    onChange={(e) => setReceiveCode(formatDisplayCode(e.target.value))}
+                    className="w-full text-center text-3xl font-mono font-extrabold tracking-widest bg-slate-50 border border-slate-300 rounded-2xl py-4 px-4 text-slate-900 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 uppercase"
+                  />
                 </div>
+
+                {isFetching && downloadStatus.percent > 0 && (
+                  <div className="bg-indigo-50 border border-indigo-200 p-3.5 rounded-2xl space-y-1.5 animate-in fade-in">
+                    <div className="flex justify-between text-xs font-semibold text-indigo-900">
+                      <span className="flex items-center space-x-1.5">
+                        <ArrowDownToLine className="w-4 h-4 text-indigo-600 animate-bounce" />
+                        <span>{downloadStatus.stage}</span>
+                      </span>
+                      <span>{downloadStatus.percent}%</span>
+                    </div>
+                    <div className="w-full bg-indigo-200/60 rounded-full h-2 overflow-hidden">
+                      <div 
+                        className="bg-indigo-600 h-2 rounded-full transition-all duration-300" 
+                        style={{ width: `${downloadStatus.percent}%` }}
+                      ></div>
+                    </div>
+                  </div>
+                )}
 
                 <button
                   onClick={() => fetchDropFromCloud(receiveCode)}
@@ -904,7 +996,7 @@ export default function App() {
                   {isFetching ? (
                     <>
                       <RefreshCw className="w-4 h-4 animate-spin text-indigo-400" />
-                      <span>Mencari di Cloud Firestore...</span>
+                      <span>Mengunduh Chunks dari Cloud...</span>
                     </>
                   ) : (
                     <>
@@ -915,7 +1007,7 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Display Fetched Received Drop Content */}
+              {/* Fetched Result View */}
               {receivedDrop && (
                 <div className="border-t border-slate-200/80 pt-6 mt-6 space-y-6 animate-in fade-in">
                   
@@ -924,44 +1016,55 @@ export default function App() {
                       <span className="text-xs font-bold text-indigo-600 bg-indigo-50 border border-indigo-200 px-2.5 py-1 rounded-full">
                         Room #{receivedDrop.formattedCode}
                       </span>
-                      <h3 className="text-base font-bold text-slate-900 mt-2">Konten Ditemukan di Cloud</h3>
+                      <h3 className="text-base font-bold text-slate-900 mt-2">Konten Ditemukan</h3>
                     </div>
-                    <span className="text-xs text-slate-500">
-                      Batas Hapus: {new Date(receivedDrop.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    </span>
+                    
+                    <button
+                      onClick={() => handleManualDelete(receivedDrop.code)}
+                      className="text-xs text-rose-600 hover:text-rose-800 font-semibold flex items-center space-x-1 bg-rose-50 px-2.5 py-1 rounded-lg border border-rose-200"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Hapus Sekarang</span>
+                    </button>
                   </div>
 
-                  {/* Received Files List */}
+                  {/* Files List */}
                   {receivedDrop.files && receivedDrop.files.length > 0 && (
                     <div className="space-y-3">
-                      <p className="text-xs font-bold text-slate-700 uppercase tracking-wider">Berkas / File Terlampir ({receivedDrop.files.length})</p>
+                      <p className="text-xs font-bold text-slate-700 uppercase tracking-wider">Berkas Terlampir ({receivedDrop.files.length})</p>
                       <div className="grid grid-cols-1 gap-3">
-                        {receivedDrop.files.map((fileItem, idx) => (
-                          <div key={idx} className="flex items-center justify-between bg-slate-50 border border-slate-200 p-3.5 rounded-2xl">
-                            <div className="flex items-center space-x-3 truncate">
-                              <div className="w-9 h-9 rounded-xl bg-white border border-slate-200 flex items-center justify-center text-indigo-600 shrink-0 shadow-sm">
-                                <FileText className="w-5 h-5" />
+                        {receivedDrop.files.map((fileMeta, fIdx) => {
+                          const fileDataUrl = downloadedFilesMap[fIdx];
+                          return (
+                            <div key={fIdx} className="flex items-center justify-between bg-slate-50 border border-slate-200 p-3.5 rounded-2xl">
+                              <div className="flex items-center space-x-3 truncate">
+                                <div className="w-9 h-9 rounded-xl bg-white border border-slate-200 flex items-center justify-center text-indigo-600 shrink-0 shadow-sm">
+                                  <FileText className="w-5 h-5" />
+                                </div>
+                                <div className="truncate">
+                                  <p className="text-xs font-bold text-slate-800 truncate">{fileMeta.name}</p>
+                                  <p className="text-[10px] text-slate-400 font-mono">
+                                    {formatBytes(fileMeta.size)} • {fileMeta.totalChunks} Chunks
+                                  </p>
+                                </div>
                               </div>
-                              <div className="truncate">
-                                <p className="text-xs font-bold text-slate-800 truncate">{fileItem.name}</p>
-                                <p className="text-[10px] text-slate-400 font-mono">{formatBytes(fileItem.size)}</p>
-                              </div>
-                            </div>
 
-                            <button
-                              onClick={() => handleDownloadFile(fileItem)}
-                              className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs px-3.5 py-2 rounded-xl flex items-center space-x-1.5 transition shrink-0"
-                            >
-                              <Download className="w-3.5 h-3.5" />
-                              <span>Unduh</span>
-                            </button>
-                          </div>
-                        ))}
+                              <button
+                                onClick={() => handleDownloadFile(fileMeta.name, fileDataUrl)}
+                                disabled={!fileDataUrl}
+                                className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-semibold text-xs px-3.5 py-2 rounded-xl flex items-center space-x-1.5 transition shrink-0"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                                <span>{fileDataUrl ? 'Unduh File' : 'Menyiapkan...'}</span>
+                              </button>
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                   )}
 
-                  {/* Received Code Snippet */}
+                  {/* Code Snippet */}
                   {receivedDrop.codeSnippet && (
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
@@ -975,15 +1078,13 @@ export default function App() {
                           className="text-xs text-indigo-600 hover:text-indigo-800 font-semibold flex items-center space-x-1 bg-indigo-50 px-2.5 py-1 rounded-lg border border-indigo-200/60"
                         >
                           <Copy className="w-3.5 h-3.5" />
-                          <span>Salin Kode Instan</span>
+                          <span>Salin Kode</span>
                         </button>
                       </div>
 
-                      <div className="relative">
-                        <pre className="bg-slate-900 text-slate-100 font-mono text-xs p-4 rounded-2xl overflow-x-auto max-h-80 leading-relaxed">
-                          <code>{receivedDrop.codeSnippet}</code>
-                        </pre>
-                      </div>
+                      <pre className="bg-slate-900 text-slate-100 font-mono text-xs p-4 rounded-2xl overflow-x-auto max-h-80 leading-relaxed">
+                        <code>{receivedDrop.codeSnippet}</code>
+                      </pre>
                     </div>
                   )}
 
@@ -1001,7 +1102,7 @@ export default function App() {
             <div className="flex items-center justify-between border-b border-slate-100 pb-4">
               <div>
                 <h2 className="text-lg font-bold text-slate-900">Riwayat Room Drop Saya</h2>
-                <p className="text-xs text-slate-500">Daftar kode transfer yang pernah dibuat di perangkat ini.</p>
+                <p className="text-xs text-slate-500">Daftar kode transfer yang pernah dibuat dari browser ini.</p>
               </div>
 
               {myHistory.length > 0 && (
@@ -1009,7 +1110,7 @@ export default function App() {
                   onClick={() => {
                     setMyHistory([]);
                     localStorage.removeItem('campusdrop_my_history');
-                    showToast('Riwayat berhasil dibersihkan.');
+                    showToast('Riwayat dibersihkan.');
                   }}
                   className="text-xs text-rose-600 hover:text-rose-800 font-semibold flex items-center space-x-1"
                 >
@@ -1022,7 +1123,7 @@ export default function App() {
             {myHistory.length === 0 ? (
               <div className="text-center py-12 text-slate-400 space-y-2">
                 <Clock className="w-10 h-10 mx-auto text-slate-300" />
-                <p className="text-xs font-semibold">Belum ada riwayat drop yang dibuat.</p>
+                <p className="text-xs font-semibold">Belum ada riwayat drop.</p>
               </div>
             ) : (
               <div className="space-y-3">
@@ -1061,7 +1162,7 @@ export default function App() {
 
       </main>
 
-      {/* PIN Security Modal Popup */}
+      {/* PIN Security Modal */}
       {pinModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-white rounded-3xl max-w-sm w-full p-6 shadow-2xl border border-slate-200 space-y-4 animate-in zoom-in-95">
@@ -1112,11 +1213,11 @@ export default function App() {
         </div>
       )}
 
-      {/* Footer Info */}
+      {/* Footer */}
       <footer className="mt-16 text-center text-xs text-slate-400 space-y-1">
         <p>CampusDrop — Solusi terenkripsi & privat untuk berbagi berkas laboratorium kampus.</p>
         <p className="text-[11px] text-slate-400">
-          Setiap file terhapus otomatis sesuai batas waktu. Tekan <kbd className="bg-slate-200 text-slate-700 px-1 rounded">ESC</kbd> untuk modus penyamaran.
+          Mendukung file hingga 50MB dengan Firestore Chunking. Tekan <kbd className="bg-slate-200 text-slate-700 px-1 rounded font-mono">ESC</kbd> untuk modus penyamaran.
         </p>
       </footer>
 
